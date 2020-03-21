@@ -22,7 +22,7 @@
 #include <Columns/ColumnAggregateFunction.h>
 #include "IFunctionImpl.h"
 #include "FunctionHelpers.h"
-#include "intDiv.h"
+#include "DivisionUtils.h"
 #include "castTypeToEither.h"
 #include "FunctionFactory.h"
 #include <Common/typeid_cast.h>
@@ -95,19 +95,67 @@ struct FixedStringOperationImpl
             c[i] = Op::template apply<UInt8>(a[i], b[i]);
     }
 
-    static void NO_INLINE vector_constant(const UInt8 * __restrict a, const UInt8 * __restrict b, UInt8 * __restrict c, size_t size, size_t N)
+    template <bool inverted>
+    static void NO_INLINE vector_constant_impl(const UInt8 * __restrict a, const UInt8 * __restrict b, UInt8 * __restrict c, size_t size, size_t N)
     {
-        for (size_t i = 0; i < size; ++i)
-            c[i] = Op::template apply<UInt8>(a[i], b[i % N]);
+        /// These complications are needed to avoid integer division in inner loop.
+
+        /// Create a pattern of repeated values of b with at least 16 bytes,
+        /// so we can read 16 bytes of this repeated pattern starting from any offset inside b.
+        ///
+        /// Example:
+        ///
+        ///  N = 6
+        ///  ------
+        /// [abcdefabcdefabcdefabc]
+        ///       ^^^^^^^^^^^^^^^^
+        ///      16 bytes starting from the last offset inside b.
+
+        const size_t b_repeated_size = N + 15;
+        UInt8 b_repeated[b_repeated_size];
+        for (size_t i = 0; i < b_repeated_size; ++i)
+            b_repeated[i] = b[i % N];
+
+        size_t b_offset = 0;
+        size_t b_increment = 16 % N;
+
+        /// Example:
+        ///
+        /// At first iteration we copy 16 bytes at offset 0 from b_repeated:
+        /// [abcdefabcdefabcdefabc]
+        ///  ^^^^^^^^^^^^^^^^
+        /// At second iteration we copy 16 bytes at offset 4 = 16 % 6 from b_repeated:
+        /// [abcdefabcdefabcdefabc]
+        ///      ^^^^^^^^^^^^^^^^
+        /// At third iteration we copy 16 bytes at offset 2 = (16 * 2) % 6 from b_repeated:
+        /// [abcdefabcdefabcdefabc]
+        ///    ^^^^^^^^^^^^^^^^
+
+        /// PaddedPODArray allows overflow for 15 bytes.
+        for (size_t i = 0; i < size; i += 16)
+        {
+            /// This loop is formed in a way to be vectorized into two SIMD mov.
+            for (size_t j = 0; j < 16; ++j)
+                c[i + j] = inverted
+                    ? Op::template apply<UInt8>(a[i + j], b_repeated[b_offset + j])
+                    : Op::template apply<UInt8>(b_repeated[b_offset + j], a[i + j]);
+
+            b_offset += b_increment;
+            if (b_offset >= N) /// This condition is easily predictable.
+                b_offset -= N;
+        }
     }
 
-    static void NO_INLINE constant_vector(const UInt8 * __restrict a, const UInt8 * __restrict b, UInt8 * __restrict c, size_t size, size_t N)
+    static void vector_constant(const UInt8 * __restrict a, const UInt8 * __restrict b, UInt8 * __restrict c, size_t size, size_t N)
     {
-        for (size_t i = 0; i < size; ++i)
-            c[i] = Op::template apply<UInt8>(a[i % N], b[i]);
+        vector_constant_impl<false>(a, b, c, size, N);
+    }
+
+    static void constant_vector(const UInt8 * __restrict a, const UInt8 * __restrict b, UInt8 * __restrict c, size_t size, size_t N)
+    {
+        vector_constant_impl<true>(b, a, c, size, N);
     }
 };
-
 
 
 template <typename A, typename B, typename Op, typename ResultType = typename Op::ResultType>
@@ -499,43 +547,54 @@ class FunctionBinaryArithmetic : public IFunction
 
     FunctionOverloadResolverPtr getFunctionForIntervalArithmetic(const DataTypePtr & type0, const DataTypePtr & type1) const
     {
+        bool first_is_date_or_datetime = isDateOrDateTime(type0);
+        bool second_is_date_or_datetime = isDateOrDateTime(type1);
+
+        /// Exactly one argument must be Date or DateTime
+        if (first_is_date_or_datetime == second_is_date_or_datetime)
+            return {};
+
         /// Special case when the function is plus or minus, one of arguments is Date/DateTime and another is Interval.
         /// We construct another function (example: addMonths) and call it.
 
-        bool function_is_plus = std::is_same_v<Op<UInt8, UInt8>, PlusImpl<UInt8, UInt8>>;
-        bool function_is_minus = std::is_same_v<Op<UInt8, UInt8>, MinusImpl<UInt8, UInt8>>;
+        static constexpr bool function_is_plus = std::is_same_v<Op<UInt8, UInt8>, PlusImpl<UInt8, UInt8>>;
+        static constexpr bool function_is_minus = std::is_same_v<Op<UInt8, UInt8>, MinusImpl<UInt8, UInt8>>;
 
         if (!function_is_plus && !function_is_minus)
             return {};
 
-        int interval_arg = 1;
-        const DataTypeInterval * interval_data_type = checkAndGetDataType<DataTypeInterval>(type1.get());
-        if (!interval_data_type)
-        {
-            interval_arg = 0;
-            interval_data_type = checkAndGetDataType<DataTypeInterval>(type0.get());
-        }
-        if (!interval_data_type)
-            return {};
+        const DataTypePtr & type_time = first_is_date_or_datetime ? type0 : type1;
+        const DataTypePtr & type_interval = first_is_date_or_datetime ? type1 : type0;
 
-        if (interval_arg == 0 && function_is_minus)
+        bool interval_is_number = isNumber(type_interval);
+
+        const DataTypeInterval * interval_data_type = nullptr;
+        if (!interval_is_number)
+        {
+            interval_data_type = checkAndGetDataType<DataTypeInterval>(type_interval.get());
+
+            if (!interval_data_type)
+                return {};
+        }
+
+        if (second_is_date_or_datetime && function_is_minus)
             throw Exception("Wrong order of arguments for function " + getName() + ": argument of type Interval cannot be first.",
                 ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
 
-        const DataTypeDate * date_data_type = checkAndGetDataType<DataTypeDate>(interval_arg == 0 ? type1.get() : type0.get());
-        const DataTypeDateTime * date_time_data_type = nullptr;
-        if (!date_data_type)
+        std::string function_name;
+        if (interval_data_type)
         {
-            date_time_data_type = checkAndGetDataType<DataTypeDateTime>(interval_arg == 0 ? type1.get() : type0.get());
-            if (!date_time_data_type)
-                throw Exception("Wrong argument types for function " + getName() + ": if one argument is Interval, then another must be Date or DateTime.",
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            function_name = String(function_is_plus ? "add" : "subtract") + interval_data_type->getKind().toString() + 's';
+        }
+        else
+        {
+            if (isDate(type_time))
+                function_name = function_is_plus ? "addDays" : "subtractDays";
+            else
+                function_name = function_is_plus ? "addSeconds" : "subtractSeconds";
         }
 
-        std::stringstream function_name;
-        function_name << (function_is_plus ? "add" : "subtract") << interval_data_type->getKind().toString() << 's';
-
-        return FunctionFactory::instance().get(function_name.str(), context);
+        return FunctionFactory::instance().get(function_name, context);
     }
 
     bool isAggregateMultiply(const DataTypePtr & type0, const DataTypePtr & type1) const
@@ -578,7 +637,6 @@ class FunctionBinaryArithmetic : public IFunction
             agg_state_is_const ? assert_cast<const ColumnConst &>(agg_state_column).getDataColumn() : agg_state_column);
 
         AggregateFunctionPtr function = column.getAggregateFunction();
-
 
         size_t size = agg_state_is_const ? 1 : input_rows_count;
 
@@ -668,7 +726,7 @@ class FunctionBinaryArithmetic : public IFunction
         ColumnNumbers new_arguments = arguments;
 
         /// Interval argument must be second.
-        if (WhichDataType(block.getByPosition(arguments[0]).type).isInterval())
+        if (WhichDataType(block.getByPosition(arguments[1]).type).isDateOrDateTime())
             std::swap(new_arguments[0], new_arguments[1]);
 
         /// Change interval argument type to its representation
@@ -728,7 +786,7 @@ public:
                 new_arguments[i].type = arguments[i];
 
             /// Interval argument must be second.
-            if (WhichDataType(new_arguments[0].type).isInterval())
+            if (WhichDataType(new_arguments[1].type).isDateOrDateTime())
                 std::swap(new_arguments[0], new_arguments[1]);
 
             /// Change interval argument to its representation

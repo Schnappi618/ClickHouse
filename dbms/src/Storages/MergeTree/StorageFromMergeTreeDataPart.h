@@ -32,7 +32,6 @@ public:
     }
 
 
-
     bool supportsIndexForIn() const override { return true; }
 
     bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context) const override
@@ -52,6 +51,11 @@ public:
     {
         return part->storage.getInMemoryMetadata();
     }
+
+
+    bool hasSortingKey() const { return part->storage.hasSortingKey(); }
+
+    Names getSortingKeyColumns() const override { return part->storage.getSortingKeyColumns(); }
 
 
 protected:

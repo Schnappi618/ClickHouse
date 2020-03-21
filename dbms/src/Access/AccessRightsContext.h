@@ -60,8 +60,8 @@ public:
     UserPtr getUser() const;
     String getUserName() const;
 
-    void checkPassword(const String & password) const;
-    void checkHostIsAllowed() const;
+    bool isCorrectPassword(const String & password) const;
+    bool isClientHostAllowed() const;
 
     CurrentRolesInfoPtr getRolesInfo() const;
     std::vector<UUID> getCurrentRoles() const;
@@ -128,10 +128,10 @@ private:
     bool checkAccessImpl(Poco::Logger * log_, const AccessFlags & access, const Args &... args) const;
 
     template <int mode, bool grant_option>
-    bool checkAccessImpl(Poco::Logger * log_, const AccessRightsElement & access) const;
+    bool checkAccessImpl(Poco::Logger * log_, const AccessRightsElement & element) const;
 
     template <int mode, bool grant_option>
-    bool checkAccessImpl(Poco::Logger * log_, const AccessRightsElements & access) const;
+    bool checkAccessImpl(Poco::Logger * log_, const AccessRightsElements & elements) const;
 
     boost::shared_ptr<const AccessRights> calculateResultAccess(bool grant_option) const;
     boost::shared_ptr<const AccessRights> calculateResultAccess(bool grant_option, UInt64 readonly_, bool allow_ddl_, bool allow_introspection_) const;

@@ -21,8 +21,6 @@
 #include <Disks/DiskSpaceMonitor.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/checkDataPart.h>
-#include <Poco/DirectoryIterator.h>
-#include <Poco/File.h>
 #include <optional>
 #include <Interpreters/MutationsInterpreter.h>
 #include <Processors/Pipe.h>
@@ -253,7 +251,7 @@ std::vector<MergeTreeData::AlterDataPartTransactionPtr> StorageMergeTree::prepar
 }
 
 void StorageMergeTree::alter(
-    const AlterCommands & params,
+    const AlterCommands & commands,
     const Context & context,
     TableStructureWriteLockHolder & table_lock_holder)
 {
@@ -263,7 +261,7 @@ void StorageMergeTree::alter(
 
     StorageInMemoryMetadata metadata = getInMemoryMetadata();
 
-    params.apply(metadata);
+    commands.apply(metadata);
 
     /// Update metdata in memory
     auto update_metadata = [&metadata, &table_lock_holder, this]()
@@ -277,11 +275,11 @@ void StorageMergeTree::alter(
     };
 
     /// This alter can be performed at metadata level only
-    if (!params.isModifyingData())
+    if (!commands.isModifyingData())
     {
         lockStructureExclusively(table_lock_holder, context.getCurrentQueryId());
 
-        context.getDatabase(table_id.database_name)->alterTable(context, table_id.table_name, metadata);
+        DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(context, table_id.table_name, metadata);
 
         update_metadata();
     }
@@ -298,7 +296,7 @@ void StorageMergeTree::alter(
 
         lockStructureExclusively(table_lock_holder, context.getCurrentQueryId());
 
-        context.getDatabase(table_id.database_name)->alterTable(context, table_id.table_name, metadata);
+        DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(context, table_id.table_name, metadata);
 
         update_metadata();
 
@@ -416,8 +414,8 @@ void StorageMergeTree::mutate(const MutationCommands & commands, const Context &
 {
     /// Choose any disk, because when we load mutations we search them at each disk
     /// where storage can be placed. See loadMutations().
-    auto disk = storage_policy->getAnyDisk();
-    MergeTreeMutationEntry entry(commands, getFullPathOnDisk(disk), insert_increment.get());
+    auto disk = getStoragePolicy()->getAnyDisk();
+    MergeTreeMutationEntry entry(commands, disk, relative_data_path, insert_increment.get());
     String file_name;
     Int64 version;
     {
@@ -558,22 +556,20 @@ CancellationCode StorageMergeTree::killMutation(const String & mutation_id)
 
 void StorageMergeTree::loadMutations()
 {
-    Poco::DirectoryIterator end;
-    const auto full_paths = getDataPaths();
-    for (const String & full_path : full_paths)
+    for (const auto & [path, disk] : getRelativeDataPathsWithDisks())
     {
-        for (auto it = Poco::DirectoryIterator(full_path); it != end; ++it)
+        for (auto it = disk->iterateDirectory(path); it->isValid(); it->next())
         {
-            if (startsWith(it.name(), "mutation_"))
+            if (startsWith(it->name(), "mutation_"))
             {
-                MergeTreeMutationEntry entry(full_path, it.name());
+                MergeTreeMutationEntry entry(disk, path, it->name());
                 Int64 block_number = entry.block_number;
-                auto insertion = current_mutations_by_id.emplace(it.name(), std::move(entry));
+                auto insertion = current_mutations_by_id.emplace(it->name(), std::move(entry));
                 current_mutations_by_version.emplace(block_number, insertion.first->second);
             }
-            else if (startsWith(it.name(), "tmp_mutation_"))
+            else if (startsWith(it->name(), "tmp_mutation_"))
             {
-                it->remove();
+                disk->remove(it->path());
             }
         }
     }
@@ -618,7 +614,7 @@ bool StorageMergeTree::merge(
         }
         else
         {
-            UInt64 disk_space = storage_policy->getMaxUnreservedFreeSpace();
+            UInt64 disk_space = getStoragePolicy()->getMaxUnreservedFreeSpace();
             selected = merger_mutator.selectAllPartsToMergeWithinPartition(future_part, disk_space, can_merge, partition_id, final, out_disable_reason);
         }
 
@@ -1046,8 +1042,8 @@ void StorageMergeTree::alterPartition(const ASTPtr & query, const PartitionComma
 
                     case PartitionCommand::MoveDestinationType::TABLE:
                         checkPartitionCanBeDropped(command.partition);
-                        String dest_database = command.to_database.empty() ? context.getCurrentDatabase() : command.to_database;
-                        auto dest_storage = context.getTable(dest_database, command.to_table);
+                        String dest_database = context.resolveDatabase(command.to_database);
+                        auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table});
                         movePartitionToTable(dest_storage, command.partition, context);
                         break;
                 }
@@ -1058,8 +1054,8 @@ void StorageMergeTree::alterPartition(const ASTPtr & query, const PartitionComma
             case PartitionCommand::REPLACE_PARTITION:
             {
                 checkPartitionCanBeDropped(command.partition);
-                String from_database = command.from_database.empty() ? context.getCurrentDatabase() : command.from_database;
-                auto from_storage = context.getTable(from_database, command.from_table);
+                String from_database = context.resolveDatabase(command.from_database);
+                auto from_storage = DatabaseCatalog::instance().getTable({from_database, command.from_table});
                 replacePartitionFrom(from_storage, command.partition, command.replace, context);
             }
             break;
@@ -1326,26 +1322,26 @@ CheckResults StorageMergeTree::checkData(const ASTPtr & query, const Context & c
 
     for (auto & part : data_parts)
     {
-        String full_part_path = part->getFullPath();
+        auto disk = part->disk;
+        String part_path = part->getFullRelativePath();
         /// If the checksums file is not present, calculate the checksums and write them to disk.
-        String checksums_path = full_part_path + "checksums.txt";
-        String tmp_checksums_path = full_part_path + "checksums.txt.tmp";
-        if (!Poco::File(checksums_path).exists())
+        String checksums_path = part_path + "checksums.txt";
+        String tmp_checksums_path = part_path + "checksums.txt.tmp";
+        if (!disk->exists(checksums_path))
         {
             try
             {
                 auto calculated_checksums = checkDataPart(part, false);
                 calculated_checksums.checkEqual(part->checksums, true);
-                WriteBufferFromFile out(tmp_checksums_path, 4096);
-                part->checksums.write(out);
-                Poco::File(tmp_checksums_path).renameTo(checksums_path);
+                auto out = disk->writeFile(tmp_checksums_path, 4096);
+                part->checksums.write(*out);
+                disk->moveFile(tmp_checksums_path, checksums_path);
                 results.emplace_back(part->name, true, "Checksums recounted and written to disk.");
             }
             catch (const Exception & ex)
             {
-                Poco::File tmp_file(tmp_checksums_path);
-                if (tmp_file.exists())
-                    tmp_file.remove();
+                if (disk->exists(tmp_checksums_path))
+                    disk->remove(tmp_checksums_path);
 
                 results.emplace_back(part->name, false,
                     "Check of part finished with error: '" + ex.message() + "'");
